@@ -8406,6 +8406,7 @@ fn nested_union_members<'db>(
 pub(crate) struct ArgumentContextCache<'db> {
     ordinary: OnceCell<Cow<'db, ArgumentContextSpecialization<'db>>>,
     nested: OnceCell<Option<Specialization<'db>>>,
+    paramspec: OnceCell<Option<Vec<Option<Type<'db>>>>>,
 }
 
 /// The call specialization inferred during fixpoint generic call inference.
@@ -8542,7 +8543,6 @@ struct ParamSpecArgumentContext<'a, 'call, 'db> {
     binding: &'a CallableBinding<'db>,
     paramspec_value: ParamSpecValue<'db>,
     arguments_types: &'a CallArguments<'call, 'db>,
-    argument_index: usize,
     call_expression_tcx: TypeContext<'db>,
 }
 
@@ -8799,21 +8799,21 @@ impl<'db> Binding<'db> {
             .collect()
     }
 
-    /// Returns the specialized wrapped-call parameter type for a forwarded argument.
+    /// Returns the specialized wrapped-call parameter types for forwarded arguments.
     ///
     /// The forwarded outer arguments are first projected into a sub-call against the callable stored
-    /// in `P`. The parameter matched by `argument_index` in that sub-call becomes the context for
-    /// bidirectional inference.
+    /// in `P`. Checking that sub-call provisionally gives all forwarded arguments the same
+    /// specialization for the next round of bidirectional inference.
     ///
     /// ```py
     /// def put_object(*, TagSet: list[Tag]) -> None: ...
     /// def wrapper[**P, R](func: Callable[P, R], /, **kwargs: P.kwargs) -> R: ...
     /// wrapper(put_object, TagSet=[{"Key": "k", "Value": "v"}])  # context is `list[Tag]`
     /// ```
-    fn paramspec_argument_context(
+    fn paramspec_argument_contexts(
         &self,
         context: &ParamSpecArgumentContext<'_, '_, 'db>,
-    ) -> Option<Type<'db>> {
+    ) -> Option<Vec<Option<Type<'db>>>> {
         let ParamSpecArgumentContext {
             db,
             env,
@@ -8821,7 +8821,6 @@ impl<'db> Binding<'db> {
             binding,
             paramspec_value,
             arguments_types,
-            argument_index,
             call_expression_tcx,
         } = *context;
         let callable = paramspec_value.to_callable_type(db, env)?;
@@ -8829,19 +8828,11 @@ impl<'db> Binding<'db> {
         let (prefix, _) = self.signature.parameters().as_paramspec_with_prefix()?;
         let paramspec_argument_indices =
             self.paramspec_call_argument_indices(binding, prefix.len());
-        let sub_argument_index = paramspec_argument_indices
-            .iter()
-            .position(|paramspec_argument_index| *paramspec_argument_index == argument_index)?;
-
-        let mut sub_arguments = arguments_types.select_for_paramspec(
+        let sub_arguments = arguments_types.select_for_paramspec(
             &paramspec_argument_indices,
             self.signature.parameters(),
             prefix.len(),
         );
-        // Clear the previously inferred type for this argument, if it was inferred in the previous
-        // fixpoint iteration.
-        sub_arguments.clear_types(sub_argument_index);
-
         let mut specialized_bindings =
             callable
                 .bindings(db, env)
@@ -8853,42 +8844,45 @@ impl<'db> Binding<'db> {
             &sub_arguments,
             call_expression_tcx,
             &[],
-            CheckTypesMode::Finalize,
+            CheckTypesMode::Provisional,
         );
 
-        let mut contexts = Vec::new();
-        for specialized_binding in specialized_bindings.iter_flat() {
-            for (_, specialized_overload) in specialized_binding.matching_overloads() {
-                let [specialized_parameter] = specialized_overload
-                    .argument_matches()
-                    .get(sub_argument_index)?
-                    .parameters
-                    .as_slice()
-                else {
-                    return None;
-                };
+        let mut overloads = Vec::new();
+        specialized_bindings.visit_type_context_callables(&mut |binding| {
+            let mut matches = binding.matching_overloads().peekable();
+            if matches.peek().is_some() {
+                overloads.extend(
+                    matches
+                        .map(|(_, overload)| (overload, binding, ArgumentContextCache::default())),
+                );
+            } else if let Some(overload) = binding.best_failing_overload() {
+                overloads.push((overload, binding, ArgumentContextCache::default()));
+            }
+        });
 
-                let mut parameter_type = specialized_overload.signature.parameters()
-                    [specialized_parameter.index]
-                    .argument_context_type()?;
-                // Preserve gradual context such as `Callable[[int], Any]`, while marking unsolved
-                // type variables in the same way as for arguments to an ordinary generic call.
-                if let Some(generic) = specialized_overload.signature.generic_context {
-                    let context = specialized_overload.argument_type_context_specialization(
+        let mut contexts = vec![None; arguments_types.len()];
+        for (sub_argument_index, &argument_index) in paramspec_argument_indices.iter().enumerate() {
+            let parameter_types = overloads.iter().filter_map(|(overload, binding, cache)| {
+                overload
+                    .argument_type_context(
                         db,
                         env,
-                        generic,
-                        specialized_overload.inference,
                         constraints,
+                        binding,
+                        &sub_arguments,
+                        sub_argument_index,
                         call_expression_tcx,
-                    );
-                    parameter_type =
-                        parameter_type.apply_specialization(db, context.specialization);
-                }
-                contexts.push(parameter_type);
+                        cache,
+                    )?
+                    .type_context()
+                    .expected_type()
+            });
+            let mut parameter_types = parameter_types.peekable();
+            if parameter_types.peek().is_some() {
+                contexts[argument_index] = Some(UnionType::from_elements(db, env, parameter_types));
             }
         }
-        (!contexts.is_empty()).then(|| UnionType::from_elements(db, env, contexts))
+        Some(contexts)
     }
 
     /// Returns the expected tuple element for an argument matched to a `TypeVarTuple`.
@@ -9056,17 +9050,23 @@ impl<'db> Binding<'db> {
                     .and_then(|merged| merged.get(db, paramspec))
                     .or_else(|| ordinary_context().specialization.get(db, paramspec))?
                     .as_paramspec_value(db)?;
-                let specialized_parameter_type =
-                    self.paramspec_argument_context(&ParamSpecArgumentContext {
-                        db,
-                        env,
-                        constraints,
-                        binding,
-                        paramspec_value,
-                        arguments_types,
-                        argument_index,
-                        call_expression_tcx,
-                    })?;
+                let specialized_parameter_type = cache
+                    .paramspec
+                    .get_or_init(|| {
+                        self.paramspec_argument_contexts(&ParamSpecArgumentContext {
+                            db,
+                            env,
+                            constraints,
+                            binding,
+                            paramspec_value,
+                            arguments_types,
+                            call_expression_tcx,
+                        })
+                    })
+                    .as_ref()?
+                    .get(argument_index)
+                    .copied()
+                    .flatten()?;
                 return Some(ArgumentTypeContext::paramspec(
                     original_parameter_type,
                     specialized_parameter_type,

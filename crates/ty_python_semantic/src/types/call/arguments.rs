@@ -721,14 +721,6 @@ impl<'a, 'db> CallArguments<'a, 'db> {
             .insert(tcx, ty);
     }
 
-    pub(crate) fn clear_types(&mut self, index: usize) {
-        *self
-            .items
-            .get_mut(index)
-            .expect("argument index should be valid")
-            .source_types_mut() = CallArgumentTypes::default();
-    }
-
     /// Returns `true` if the inferred types are equal for the given set of argument indices.
     pub(crate) fn inferred_types_equal_at(&self, other: &Self, argument_indices: &[usize]) -> bool {
         argument_indices

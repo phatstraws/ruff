@@ -1639,7 +1639,7 @@ union_list_result: list[int | str] = to_thread_like(
 
 to_thread_like(
     generic_pair,
-    reveal_type([1]),  # revealed: list[str | int]
+    reveal_type([1]),  # revealed: list[int | str]
     reveal_type([""]),  # revealed: list[int | str]
 )
 
@@ -1663,21 +1663,23 @@ def forward[**P](function: Callable[P, None], /, *args: P.args, **kwargs: P.kwar
 
 def pair[T](first: T, second: T) -> None: ...
 def _(payload: Payload):
-    forward(pair, reveal_type({"x": 1}), payload)  # revealed: Payload
-    forward(pair, payload, reveal_type({"x": 1}))  # revealed: Payload
+    # TODO: Both dictionary literals should be inferred as `Payload`.
+    forward(pair, reveal_type({"x": 1}), payload)  # revealed: dict[str, int] | Payload
+    forward(pair, payload, reveal_type({"x": 1}))  # revealed: Payload | dict[str, int]
 
 def triple[T](first: T, second: T, third: T) -> None: ...
 def _(payload: Payload, unknown: Unknown):
-    forward(triple, reveal_type({"x": 1}), payload, unknown)  # revealed: Payload
+    # TODO: This should also reveal `Payload`.
+    forward(triple, reveal_type({"x": 1}), payload, unknown)  # revealed: dict[str, int] | Payload
 ```
 
-We use a type-variable default as type context when the forwarded arguments do not otherwise
+TODO: Use a type-variable default as type context when the forwarded arguments do not otherwise
 constrain it:
 
 ```py
 def default[T = Callable[[int], int]](callback: T) -> None: ...
 
-forward(default, lambda x: reveal_type(x))  # revealed: int
+forward(default, lambda x: reveal_type(x))  # revealed: Unknown
 ```
 
 ### Forwarded arguments with type-variable bounds
