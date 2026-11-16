@@ -103,11 +103,29 @@ c: tuple[str | int, str] = ([], "foo")
 ## Incorrect collection literal assignments are complained about
 
 ```py
-# error: [invalid-assignment] "Object of type `list[str | int]` is not assignable to `list[str]`"
-a: list[str] = [1, 2, 3]
+from collections.abc import Mapping
+
+# error: [invalid-assignment] "Object of type `list[int]` is not assignable to `list[str]`"
+a: list[str] = reveal_type([1, 2, 3])  # revealed: list[int]
 
 # error: [invalid-assignment] "Object of type `set[int | str]` is not assignable to `set[int]`"
 b: set[int] = {1, 2, "3"}
+
+# error: [invalid-assignment] "Object of type `set[str]` is not assignable to `set[int]`"
+bad_set: set[int] = {"x"}
+
+# error: [invalid-assignment] "Object of type `dict[int, int]` is not assignable to `dict[str, object]`"
+bad_key: dict[str, object] = {1: 2}
+
+# error: [invalid-assignment] "Object of type `dict[int, int]` is not assignable to `dict[object, str]`"
+bad_value: dict[object, str] = {1: 2}
+
+# error: [invalid-assignment] "Object of type `dict[int, int]` is not assignable to `Mapping[str, object]`"
+bad_mapping_key: Mapping[str, object] = {1: 2}
+
+def unpack(source: dict[int, int]) -> None:
+    # error: [invalid-assignment] "Object of type `dict[int, int]` is not assignable to `dict[str, object]`"
+    bad_unpack: dict[str, object] = {**source}
 ```
 
 ## Mutually assignable annotated assignments use the declared type

@@ -7988,6 +7988,24 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         })
     }
 
+    fn unpack_dict_literal_entry(
+        &self,
+        expression: &ast::Expr,
+        ty: Type<'db>,
+    ) -> Option<(Type<'db>, Type<'db>)> {
+        let db = self.db();
+        let env = self.program_environment();
+        let unpacked = ty.unpack_keys_and_items(db, env);
+        if unpacked.is_none()
+            && let Some(builder) = self.context.report_lint(&INVALID_ARGUMENT_TYPE, expression)
+        {
+            builder
+                .into_diagnostic("Argument expression after ** must be a mapping type")
+                .set_primary_annotation_message(format_args!("Found `{}`", ty.display(db, env)));
+        }
+        unpacked
+    }
+
     // Infer the type of a collection literal expression.
     fn infer_collection_literal<'expr, const N: usize>(
         &mut self,
@@ -8116,7 +8134,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         //
         // For example, we only want the `list[int]` from `annotation: list[int] | None` if
         // `collection_ty` is `list`.
-        let tcx = tcx.map(|annotation| {
+        let mut tcx = tcx.map(|annotation| {
             let collection_ty = collection_class.to_instance(db, env);
             annotation
                 .discard_disjoint_union_elements(db, env, collection_ty, inferable)
@@ -8128,7 +8146,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // We use a forward assignability check (`identity_instance ≤ tcx`) to infer what each
         // typevar maps to in the type context. For example, if the type context is `list[int]` and
         // `collection_instance` is `list[T]`, the check produces `T = int`.
-        let (elt_tcx_constraints, elt_tcx_variance) = {
+        let (mut elt_tcx_constraints, elt_tcx_variance) = {
             let mut elt_tcx_constraints: FxHashMap<
                 BoundTypeVarIdentity<'db>,
                 UnionAccumulator<'db>,
@@ -8255,11 +8273,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let mut pre_inferred_elt_tys = None;
 
-        // Avoid projecting and solving a constraint set when contextual inference has already
-        // provided the complete specialization and every literal element is compatible with it.
-        if !has_dict_unpack
-            && tcx.expected_type().is_some()
-            && let Some(specialization) = generic_context
+        let complete_specialization = if !has_dict_unpack && tcx.expected_type().is_some() {
+            generic_context
                 .variables(self.db())
                 .map(|typevar| {
                     let identity = typevar.identity(self.db());
@@ -8276,36 +8291,66 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     elt_tcx_constraints.get(&identity).copied()
                 })
                 .collect::<Option<Vec<_>>>()
+        } else {
+            None
+        };
+        if let Some(declared_ty) = tcx.expected_type()
+            && (complete_specialization.is_some()
+                || (collection_class == KnownClass::Dict && !elt_tcx_constraints.is_empty()))
         {
-            // The slow path below adds the contextual specialization as an invariant mapping,
-            // then discards every element constraint that is already assignable to its context.
-            // Infer the elements once here and retain their types so that a failed fast-path check
-            // does not recursively re-infer nested collection literals on the slow path.
+            // Check the context before adding it as an inference constraint. Preserve the
+            // inferred expressions for the solve below.
             let mut inferred_elts = Vec::with_capacity(elts.len());
             let mut compatible = true;
 
             for elts in elts {
                 let mut inferred_elt_tys = [None; N];
-                for (i, elt, elt_tcx) in itertools::izip!(0.., elts, specialization.iter().copied())
-                {
-                    let Some(elt) = elt else { continue };
-                    let elt_tcx = if elt.is_starred_expr() && collection_class != KnownClass::Dict {
-                        Type::homogeneous_tuple(db, env, elt_tcx)
-                    } else {
-                        elt_tcx
-                    };
-                    let inferred_elt_ty =
-                        infer_elt_expression(self, (i, elt, tcx.with_expected_type(Some(elt_tcx))));
-                    inferred_elt_tys[i] = Some(inferred_elt_ty);
-
-                    if !inferred_elt_ty.is_assignable_to(db, env, elt_tcx) {
+                let mut record = |i: usize, inferred: Type<'db>, expected: Option<Type<'db>>| {
+                    inferred_elt_tys[i] = Some(inferred);
+                    if expected
+                        .is_some_and(|expected| !inferred.is_assignable_to(db, env, expected))
+                    {
                         compatible = false;
+                    }
+                };
+
+                if let &[None, Some(expression)] = elts.as_slice() {
+                    let ty = infer_elt_expression(self, (1, expression, tcx));
+                    if let Some((key, value)) = self.unpack_dict_literal_entry(expression, ty) {
+                        for (i, inferred, typevar) in
+                            itertools::izip!(0.., [key, value], elt_tys.clone())
+                        {
+                            let expected = elt_tcx_constraints.get(&typevar.identity(db)).copied();
+                            record(i, inferred, expected);
+                        }
+                    }
+                } else {
+                    for (i, elt, typevar) in itertools::izip!(0.., elts, elt_tys.clone()) {
+                        let Some(elt) = elt else { continue };
+                        let expected =
+                            elt_tcx_constraints
+                                .get(&typevar.identity(db))
+                                .copied()
+                                .map(|ty| {
+                                    if elt.is_starred_expr() && collection_class != KnownClass::Dict
+                                    {
+                                        Type::homogeneous_tuple(db, env, ty)
+                                    } else {
+                                        ty
+                                    }
+                                });
+                        let inferred =
+                            infer_elt_expression(self, (i, elt, tcx.with_expected_type(expected)));
+                        record(i, inferred, expected);
                     }
                 }
                 inferred_elts.push(inferred_elt_tys);
             }
 
-            if compatible {
+            // Avoid solving when the context already supplied the complete specialization.
+            if let Some(specialization) = complete_specialization
+                && compatible
+            {
                 let class_type = collection_alias.origin(self.db()).apply_specialization(
                     db,
                     |generic_context| {
@@ -8314,6 +8359,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                     },
                 );
                 return Type::from(class_type).to_instance_approximation(db, env);
+            }
+
+            // Retry using only the element types when the context is incompatible. The known
+            // parts of a provisional context may still be needed by an outer generic call.
+            if !compatible && !declared_ty.has_unspecialized_type_var(db, env) {
+                elt_tcx_constraints.clear();
+                tcx = TypeContext::default();
             }
 
             pre_inferred_elt_tys = Some(inferred_elts);
@@ -8414,23 +8466,18 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             // An unpacking expression for a dictionary.
             if let &[None, Some(value_expr)] = elts.as_slice() {
                 previous_evidence = [None; N];
-                let unpack_ty = infer_elt_expression(self, (1, value_expr, tcx));
-
-                let Some((unpacked_key_ty, unpacked_value_ty)) =
-                    unpack_ty.unpack_keys_and_items(db, env)
-                else {
-                    if let Some(builder) =
-                        self.context.report_lint(&INVALID_ARGUMENT_TYPE, value_expr)
-                    {
-                        let mut diag = builder
-                            .into_diagnostic("Argument expression after ** must be a mapping type");
-
-                        diag.set_primary_annotation_message(format_args!(
-                            "Found `{}`",
-                            unpack_ty.display(db, env)
-                        ));
+                let unpacked = match pre_inferred_elt_tys
+                    .as_ref()
+                    .map(|inferred| inferred[elts_index].as_slice())
+                {
+                    Some(&[key, value]) => key.zip(value),
+                    Some(_) => None,
+                    None => {
+                        let unpack_ty = infer_elt_expression(self, (1, value_expr, tcx));
+                        self.unpack_dict_literal_entry(value_expr, unpack_ty)
                     }
-
+                };
+                let Some((unpacked_key_ty, unpacked_value_ty)) = unpacked else {
                     continue;
                 };
 
