@@ -1514,6 +1514,49 @@ mod tests {
     }
 
     #[test]
+    fn del_in_enclosing_function_after_use() {
+        flakes(
+            r"
+        def f():
+            x = 1
+
+            def g():
+                return x
+
+            try:
+                return g()
+            finally:
+                del x
+        ",
+            &[],
+        );
+    }
+
+    #[test]
+    fn del_in_enclosing_function_before_use() {
+        flakes(
+            r"
+        def f():
+            x = 1
+            del x
+
+            def g():
+                return x
+
+            return g()
+
+        y = 1
+
+        def h():
+            return y
+
+        del y
+        ",
+            &[Rule::UndefinedName, Rule::UndefinedName],
+        );
+    }
+
+    #[test]
     fn global_from_nested_scope() {
         // Global names are available from nested scopes.
         flakes(

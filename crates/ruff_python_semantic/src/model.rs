@@ -645,7 +645,9 @@ impl<'a> SemanticModel<'a> {
                         // stubs, the `Deletion` binding is seen at resolve time even
                         // though the reference textually precedes the `del`. Resolve
                         // to the shadowed (pre-`del`) binding when available.
-                        if self.in_stub_file() {
+                        let deletion_in_enclosing_function =
+                            index > 0 && self.scopes[scope_id].kind.is_function();
+                        if self.in_stub_file() || deletion_in_enclosing_function {
                             if let Some(shadowed_id) =
                                 self.scopes[scope_id].shadowed_binding(binding_id)
                             {
